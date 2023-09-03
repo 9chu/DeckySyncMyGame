@@ -1,0 +1,10 @@
+{
+  "name": "SyncMyGame",
+  "author": "chu",
+  "flags": [],
+  "publish": {
+    "tags": ["sync", "non-steam"],
+    "description": "A Steam Deck plugin for syncing non-steam games into Steam library",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
