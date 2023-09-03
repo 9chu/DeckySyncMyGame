@@ -10,6 +10,9 @@ export interface GameDesc {
   compat: string;
   hidden: boolean;
   icon: string;
+  hero: string;
+  logo: string;
+  grid: string;
 }
 
 export const getGameCount = async (serverAPI: ServerAPI): Promise<number> => {
@@ -63,4 +66,11 @@ export const getConfig = async (serverAPI: ServerAPI, key: string): Promise<stri
 
 export const setConfig = async (serverAPI: ServerAPI, key: string, value: string): Promise<void> => {
   await serverAPI.callPluginMethod<{ key: string, value: string }, void>('set_config', { key, value });
+};
+
+export const readFileBase64 = async (serverAPI: ServerAPI, path: string): Promise<string | null> => {
+  const ret = await serverAPI.callPluginMethod<{ path: string }, string>('read_file_base64', { path });
+  if (ret.success)
+      return ret.result;
+  return null;
 };

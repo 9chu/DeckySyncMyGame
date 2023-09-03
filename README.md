@@ -20,7 +20,7 @@
 }
 ```
 
-如果想配置 Icon，放置 `.gameicon.png` 在相同目录。
+如果想配置 Icon，放置 `.gameicon.png` 在相同目录。同理，可以配置`.gamehero.png`（Banner图）、`.gamegrid.png`（纵版Grid缩略图）和`.gamelogo.png`（Logo图）。
 
 一个典型的配置如下：
 

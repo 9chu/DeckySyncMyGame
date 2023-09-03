@@ -1,5 +1,7 @@
 import os
+import time
 import json
+import base64
 import sqlite3
 import hashlib
 import asyncio
@@ -31,6 +33,9 @@ CONFIG_DATABASE_PATH = os.path.join(os.environ["DECKY_PLUGIN_SETTINGS_DIR"], "da
 DEFAULT_GAME_LIB_DIR = "~/MyGames"
 GAME_INFO_FILENAME = ".gameinfo.json"
 GAME_ICON_FILENAME = ".gameicon.png"
+GAME_HERO_FILENAME = ".gamehero.png"
+GAME_LOGO_FILENAME = ".gamelogo.png"
+GAME_GRID_FILENAME = ".gamegrid.png"
 
 ################################################################################
 # Utils
@@ -68,6 +73,13 @@ async def async_calc_md5(path: str) -> str:
         return hash_md5.hexdigest()
     return await async_run(impl)
 
+
+async def async_read_file_base64(path: str) -> str:
+    def impl():
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    return await async_run(impl)
+
 ################################################################################
 # Main
 ################################################################################
@@ -90,6 +102,8 @@ class DbProxy:
                 fut.set_result(result)
             except Exception as ex:
                 fut.set_exception(ex)
+            if len(self._pending_sql) == 0:
+                time.sleep(0.5)
 
     def _async_execute_sql(self, sql: str, args = ()) -> asyncio.Future:
         decky_plugin.logger.debug(f"Add SQL to queue: {sql} {args}")
@@ -158,13 +172,13 @@ class DbProxy:
         self._dirty = True
 
     def commit(self):
-        if self._dirty:
+        if self._dirty and self._async_task_future is None:
             self._dirty = False
             decky_plugin.logger.info("Saving changes")
-            if self._async_task_future is not None:
-                self._async_task_future.add_done_callback(lambda _: self._conn.commit())
-            else:
+            try:
                 self._conn.commit()
+            except Exception as ex:
+                decky_plugin.logger.exception("Failed to commit database")
     
     async def close(self):
         if self._async_task_future is not None:
@@ -176,6 +190,15 @@ class DbProxy:
 
 class GameDesc:
     @staticmethod
+    async def load_artwork(dir, filename):
+        path = os.path.join(dir, filename)
+        if os.path.exists(path):
+            md5 = await async_calc_md5(path)
+        else:
+            md5 = ''
+        return path, md5
+
+    @staticmethod
     async def from_file(path: str) -> "GameDesc":
         desc_dir = os.path.abspath(os.path.dirname(path))
 
@@ -185,12 +208,11 @@ class GameDesc:
         if "name" not in data or "executable" not in data:
             raise RuntimeError(f"Invalid game info file: {path}")
 
-        # looking for icon file
-        icon_path = os.path.join(desc_dir, GAME_ICON_FILENAME)
-        if os.path.exists(icon_path):
-            icon_md5 = await async_calc_md5(icon_path)
-        else:
-            icon_md5 = ''
+        # looking for artworks
+        icon_path, icon_md5 = await GameDesc.load_artwork(desc_dir, GAME_ICON_FILENAME)
+        hero_path, hero_md5 = await GameDesc.load_artwork(desc_dir, GAME_HERO_FILENAME)
+        logo_path, logo_md5 = await GameDesc.load_artwork(desc_dir, GAME_LOGO_FILENAME)
+        grid_path, grid_md5 = await GameDesc.load_artwork(desc_dir, GAME_GRID_FILENAME)
 
         return GameDesc(
             path,
@@ -201,10 +223,13 @@ class GameDesc:
             data.get("options", ""),
             data.get("compat", ""),
             data.get("hidden", False),
-            icon_md5,
-            icon_path if icon_md5 != '' else '')
+            icon_md5, icon_path if icon_md5 != '' else '',
+            hero_md5, hero_path if hero_md5 != '' else '',
+            logo_md5, logo_path if logo_md5 != '' else '',
+            grid_md5, grid_path if grid_md5 != '' else '')
 
-    def __init__(self, meta_path, name, title, executable, directory, options, compat, hidden, icon_md5, icon_path):
+    def __init__(self, meta_path, name, title, executable, directory, options, compat, hidden, icon_md5, icon_path,
+                 hero_md5, hero_path, logo_md5, logo_path, grid_md5, grid_path):
         self.meta_path = meta_path  # type: str
         self.name = name  # type: str
         self.title = title  # type: str
@@ -215,10 +240,16 @@ class GameDesc:
         self.hidden = hidden  # type: bool
         self.icon_md5 = icon_md5  # type: str
         self.icon_path = icon_path  # type: str
+        self.hero_md5 = hero_md5  # type: str
+        self.hero_path = hero_path  # type: str
+        self.logo_md5 = logo_md5  # type: str
+        self.logo_path = logo_path  # type: str
+        self.grid_md5 = grid_md5  # type: str
+        self.grid_path = grid_path  # type: str
 
     def make_key(self):
         unique_desc = [self.meta_path, self.name, self.title, self.executable, self.directory, self.options,
-                       self.compat, str(self.hidden), self.icon_md5]
+                       self.compat, str(self.hidden), self.icon_md5, self.hero_md5, self.logo_md5, self.grid_md5]
         return hashlib.sha256(":".join(unique_desc).encode("utf-8")).hexdigest()
     
     def to_dict(self):
@@ -231,6 +262,9 @@ class GameDesc:
             "compat": self.compat,
             "hidden": self.hidden,
             "icon": self.icon_path,
+            "hero": self.hero_path,
+            "logo": self.logo_path,
+            "grid": self.grid_path,
         }
 
 
@@ -352,11 +386,8 @@ class PluginImpl:
         decky_plugin.logger.info("Entering main loop")
         while True:
             if len(self._request_queue) == 0:
+                self._db.commit()
                 await asyncio.sleep(1)
-                try:
-                    self._db.commit()
-                except Exception as ex:
-                    decky_plugin.logger.exception("Failed to commit database")
                 continue
             future, func, args = self._request_queue.pop(0)
             try:
@@ -409,6 +440,9 @@ class Plugin:
 
     async def set_config(self, key: str, value: str):  # export
         return await self.instance.set_config(key, value)
+    
+    async def read_file_base64(self, path: str):  # export
+        return await async_read_file_base64(path)
 
     async def _main(self):
         Plugin.instance = self.instance = PluginImpl()

@@ -20,7 +20,8 @@ import {
   getShortcutToRemove,
   getShortcutToAdd,
   notifyShortcutRemoved,
-  notifyShortcutAdded
+  notifyShortcutAdded,
+  readFileBase64
 } from './backend';
 import { SettingsRouter } from './components/settings/SettingsRouter';
 
@@ -61,13 +62,14 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
     for (const key in gamesToAdd) {
       const game = gamesToAdd[key];
       
+      let appId;
       try {
         console.log('Adding shortcut:', key, game.name);
         console.log(game);
         
         // Add shortcut
         // Setting name, directory or launch options seems not to work
-        const appId = await SteamClient.Apps.AddShortcut(
+        appId = await SteamClient.Apps.AddShortcut(
           game.name,
           game.executable,
           game.directory,
@@ -81,15 +83,34 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           SteamClient.Apps.SetShortcutLaunchOptions(appId, game.options);
         if (game.compat !== '')
           SteamClient.Apps.SpecifyCompatTool(appId, game.compat);
-        if (game.hidden)
+        if (game.hidden) {
           SteamClient.Apps.SetAppHidden(appId, true);
+          await delay(500);
+          SteamClient.Apps.SetAppHidden(appId, true);
+        }
+
+        // Set artworks
         if (game.icon !== '')
           (SteamClient.Apps as any).SetShortcutIcon(appId, game.icon);
+        if (game.grid !== '')
+          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.grid), 'png', 0);
+        if (game.hero !== '')
+          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.hero), 'png', 1);
+        if (game.logo !== '')
+          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.logo), 'png', 2);
 
         // Notify backend
         await notifyShortcutAdded(serverAPI, key, appId);
       } catch (ex) {
         console.error(ex);
+
+        if (appId !== null && appId !== undefined) {
+          try {
+            SteamClient.Apps.RemoveShortcut(appId);
+          } catch (ex) {
+            console.error(ex);
+          }
+        }
       }
     }
   };
