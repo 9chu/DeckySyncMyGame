@@ -6,9 +6,14 @@ import {
   Router,
   ServerAPI,
   staticClasses,
+  Field,
+  Spinner,
+  showModal,
+  ShowModalResult,
 } from 'decky-frontend-lib';
-import { VFC, useEffect, useState } from 'react';
+import { VFC, useEffect, useState, useCallback } from 'react';
 import { RiRefreshFill } from 'react-icons/ri';
+import CancellationToken from 'cancellationtoken';
 import {
   getManagedGameCount,
   isScanning,
@@ -18,25 +23,24 @@ import {
   addManagedGame,
   removeManagedGame,
 } from './backend';
-import { addGameApp } from './utils';
+import { delay, addGameApp } from './utils';
+import { ModalLoading } from './components/ModalLoading';
 import { SettingsRouter } from './components/settings/SettingsRouter';
 
 const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
+  const [stateStatusLoading, stateSetStatusLoading] = useState<boolean>(true);
   const [stateGameCount, stateSetGameCount] = useState<number>(0);
   const [stateRefreshInProgress, stateSetRefreshInProgress] = useState<boolean>(false);
 
-  const handleRefreshGames = async (serverAPI: ServerAPI) => {
+  const handleRefreshGames = async (serverAPI: ServerAPI, updateHint: (content: string) => void,
+      token: CancellationToken) => {
     console.log('Start refresh');
 
     // Scan directories
-    const ret = await refreshGames(serverAPI);
-    if (!ret) {
-      console.error(`refreshGames rets false`);
-      return;
-    }
+    await refreshGames(serverAPI);
   
     // Delete outdated games
-    const gamesToRemove = await getAllRemovedGames(serverAPI);
+    const gamesToRemove = await getAllRemovedGames(serverAPI, token);
     console.log(`Deleting outdated games, count=${Object.keys(gamesToRemove).length}`);
     for (const key in gamesToRemove) {
       const appId = gamesToRemove[key];
@@ -44,6 +48,7 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
       // Remove game
       try {
         console.log(`Removing game: ${appId}`);
+        updateHint(`Removing ${appId}`);
         SteamClient.Apps.RemoveShortcut(appId);
       } catch (ex) {
         console.error(ex);
@@ -51,10 +56,12 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
       // Notify backend
       await removeManagedGame(serverAPI, key);
+
+      token.throwIfCancelled();
     }
 
     // Add new games
-    const gamesToAdd = await getAllUnmanagedGames(serverAPI);
+    const gamesToAdd = await getAllUnmanagedGames(serverAPI, token);
     console.log(`Adding new games, count=${Object.keys(gamesToAdd).length}`);
     for (const key in gamesToAdd) {
       const game = gamesToAdd[key];
@@ -64,11 +71,8 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         console.log(`Adding game: ${game.name}`);
         
         // Add game app
-        appId = await addGameApp(serverAPI, game);
-        if (appId === null) {
-          console.error(`Failed to add game: ${game.name}`);
-          continue;
-        }
+        updateHint(`Adding ${game.name}`);
+        appId = await addGameApp(serverAPI, game, token);
 
         // Notify backend
         await addManagedGame(serverAPI, key, appId);
@@ -83,35 +87,49 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           }
         }
       }
+
+      token.throwIfCancelled();
     }
 
     // Update game count
-    console.log(`Updating game counter`);
     stateSetGameCount(await getManagedGameCount(serverAPI));
 
     console.log('Refresh finished');
+    updateHint(`All done!`);
   };
   
   const onMount = async () => {
-    const count = await getManagedGameCount(serverAPI);
-    stateSetGameCount(count);
-
-    const scanning = await isScanning(serverAPI);
-    stateSetRefreshInProgress(scanning);
+    stateSetGameCount(await getManagedGameCount(serverAPI));
+    stateSetStatusLoading(false);
+    stateSetRefreshInProgress(await isScanning(serverAPI));
   };
 
-  const onRefreshClicked = () => {
-    stateSetRefreshInProgress(true);
-    handleRefreshGames(serverAPI)
-      .finally(() => {
-        stateSetRefreshInProgress(false);
-      });
-  };
-
-  const onOpenSettingsClicked = () => {
+  const onOpenSettingsClicked = useCallback(() => {
     Router.CloseSideMenus();
     Router.Navigate('/decky-sync-my-game/settings');
-  };
+  }, [serverAPI]);
+
+  const onRefreshClicked = useCallback(() => {
+    let modalResult: ShowModalResult;
+    const handle = async (serverAPI: ServerAPI, updateHint: (content: string) => void, token: CancellationToken) => {
+      stateSetRefreshInProgress(true);
+
+      try {
+        await handleRefreshGames(serverAPI, updateHint, token);
+      } catch (ex) {
+        updateHint('Error occur, please check CEF console');
+        console.error(ex);
+        await delay(2000);
+      } finally {
+        stateSetRefreshInProgress(false);
+      }
+
+      await delay(1000);
+      modalResult?.Close();
+    };
+
+    modalResult = showModal(<ModalLoading serverAPI={serverAPI} onMount={handle}/>);
+  }, [serverAPI]);
 
   useEffect(() => {
     onMount()
@@ -119,13 +137,26 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         console.log('Mounted');
       });
   }, [serverAPI]);
-  
+
+  let statusElement;
+  if (stateStatusLoading) {
+    statusElement = (
+      <Field label='Loading...'>
+        <Spinner/>
+      </Field>
+    );
+  } else {
+    statusElement = (
+      <Field label='Managed games:'>
+        {stateGameCount}
+      </Field>
+    )
+  }
+
   return (
     <PanelSection title='Status'>
       <PanelSectionRow>
-        <div style={{ display: 'flex', justifyContent: 'left' }}>
-          Current games: {stateGameCount}
-        </div>
+        {statusElement}
       </PanelSectionRow>
 
       <PanelSectionRow>

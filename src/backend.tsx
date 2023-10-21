@@ -1,5 +1,6 @@
 import { ServerAPI } from 'decky-frontend-lib';
 import { Base64 } from 'js-base64';
+import CancellationToken from 'cancellationtoken';
 
 export enum GameArtworkTypes {
   icon = -1,
@@ -30,15 +31,14 @@ export const getConfig = async (serverAPI: ServerAPI, key: string): Promise<stri
   if (ret.success) {
     return ret.result;
   } else {
-    console.error(`Failed to get config ${key}`);
-    return null;
+    throw new Error(`Failed to get config ${key}`);
   }
 };
 
 export const setConfig = async (serverAPI: ServerAPI, key: string, value: string): Promise<void> => {
   const ret = await serverAPI.callPluginMethod<{ key: string, value: string }, void>('set_config', { key, value });
   if (!ret.success) {
-    console.error(`Failed to set config ${key}`);
+    throw new Error(`Failed to set config ${key}`);
   }
 };
 
@@ -62,13 +62,11 @@ export const getManagedGameCount = async (serverAPI: ServerAPI): Promise<number>
   }
 };
 
-export const refreshGames = async (serverAPI: ServerAPI): Promise<boolean> => {
+export const refreshGames = async (serverAPI: ServerAPI): Promise<void> => {
   const ret = await serverAPI.callPluginMethod<{}, boolean>('refresh_games', {});
-  if (!ret.success) {
-    console.error(`Failed to refresh games`);
-    return false;
+  if (!ret.success || !ret.result) {
+    throw new Error(`Failed to refresh games`);
   }
-  return true;
 };
 
 export const getManagedGames = async (serverAPI: ServerAPI, page: number): Promise<Record<string, number>> => {
@@ -76,12 +74,11 @@ export const getManagedGames = async (serverAPI: ServerAPI, page: number): Promi
   if (ret.success) {
     return ret.result;
   } else {
-    console.error(`Failed to get managed games, page: ${page}`);
-    return {};
+    throw new Error(`Failed to get managed games, page: ${page}`);
   }
 };
 
-export const getAllManagedGames = async (serverAPI: ServerAPI): Promise<Record<string, number>> => {
+export const getAllManagedGames = async (serverAPI: ServerAPI, token?: CancellationToken): Promise<Record<string, number>> => {
   const ret = {};
 
   let page = 0;
@@ -94,6 +91,7 @@ export const getAllManagedGames = async (serverAPI: ServerAPI): Promise<Record<s
       break;
     }
     page += 1;
+    token?.throwIfCancelled();
   }
   return ret;
 };
@@ -104,12 +102,11 @@ export const getUnmanagedGames = async (serverAPI: ServerAPI, page: number): Pro
   if (ret.success) {
     return ret.result;
   } else {
-    console.error(`Failed to get unmanaged games, page: ${page}`);
-    return {};
+    throw new Error(`Failed to get unmanaged games, page: ${page}`);
   }
 };
 
-export const getAllUnmanagedGames = async (serverAPI: ServerAPI): Promise<Record<string, GameDesc>> => {
+export const getAllUnmanagedGames = async (serverAPI: ServerAPI, token?: CancellationToken): Promise<Record<string, GameDesc>> => {
   const ret = {};
 
   let page = 0;
@@ -122,6 +119,7 @@ export const getAllUnmanagedGames = async (serverAPI: ServerAPI): Promise<Record
       break;
     }
     page += 1;
+    token?.throwIfCancelled();
   }
   return ret;
 };
@@ -132,12 +130,12 @@ export const getRemovedGames = async (serverAPI: ServerAPI, page: number): Promi
   if (ret.success) {
     return ret.result;
   } else {
-    console.error(`Failed to get removed games, page: ${page}`);
-    return {};
+    throw new Error(`Failed to get removed games, page: ${page}`);
   }
 };
 
-export const getAllRemovedGames = async (serverAPI: ServerAPI): Promise<Record<string, number>> => {
+export const getAllRemovedGames = async (serverAPI: ServerAPI, token?: CancellationToken)
+    : Promise<Record<string, number>> => {
   const ret = {};
 
   let page = 0;
@@ -150,6 +148,7 @@ export const getAllRemovedGames = async (serverAPI: ServerAPI): Promise<Record<s
       break;
     }
     page += 1;
+    token?.throwIfCancelled();
   }
   return ret;
 };
@@ -170,29 +169,25 @@ export const removeManagedGame = async (serverAPI: ServerAPI, key: string): Prom
 };
 
 export const readFile = async (serverAPI: ServerAPI, path: string, offset: number, size: number)
-  : Promise<Uint8Array | null> => {
+  : Promise<Uint8Array> => {
   const ret = await serverAPI.callPluginMethod<{ path: string, offset: number, size: number }, string | null>(
     'read_file', { path, offset, size });
   if (ret.success) {
     if (ret.result) {
       return Base64.toUint8Array(ret.result);
     }
-  } else {
-    console.error(`Failed to read file, path: ${path}, offset: ${offset}, size: ${size}`);
   }
-  return null;
+  throw new Error(`Failed to read file, path: ${path}, offset: ${offset}, size: ${size}`);
 };
 
-export const readWholeFile = async (serverAPI: ServerAPI, path: string): Promise<Uint8Array | null> => {
+export const readWholeFile = async (serverAPI: ServerAPI, path: string, token?: CancellationToken)
+    : Promise<Uint8Array> => {
   const CHUNK_SIZE = 4096;
   
   let ret = null;
   let offset = 0;
   while (true) {
     const chunk = await readFile(serverAPI, path, offset, CHUNK_SIZE);
-    if (chunk === null) {
-      return null;
-    }
     if (ret === null) {
       ret = chunk;
     } else {
@@ -206,6 +201,7 @@ export const readWholeFile = async (serverAPI: ServerAPI, path: string): Promise
       break;
     }
     offset += CHUNK_SIZE;
+    token?.throwIfCancelled();
   }
   return ret;
 };

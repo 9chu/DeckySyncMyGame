@@ -1,8 +1,11 @@
 import { Base64 } from 'js-base64';
 import { ServerAPI } from 'decky-frontend-lib';
+import CancellationToken from 'cancellationtoken';
 import {
     GameDesc,
     GameArtworkTypes,
+    getAllManagedGames,
+    removeManagedGame,
     readWholeFile,
 } from './backend';
 
@@ -21,16 +24,19 @@ export const testIfGameAppExists = (appId: number) => {
  * Add game app
  * @param desc Description
  */
-export const addGameApp = async (serverAPI: ServerAPI, desc: GameDesc) => {
+export const addGameApp = async (serverAPI: ServerAPI, desc: GameDesc, token?: CancellationToken): Promise<number> => {
   const appId = await SteamClient.Apps.AddShortcut(
     desc.name,
     desc.executable,
     '',  // arguments
     '');  // cmdline
   if (appId === null || appId === undefined)
-    return null;
+    throw new Error(`AddShortcut fail, name: ${desc.name}, exe: ${desc.executable}`);
+  await delay(500);
 
   SteamClient.Apps.SetShortcutName(appId, desc.title);
+  await delay(500);
+  
   SteamClient.Apps.SetShortcutStartDir(appId, desc.directory);
 
   if (desc.options !== '') {
@@ -60,22 +66,68 @@ export const addGameApp = async (serverAPI: ServerAPI, desc: GameDesc) => {
       continue;
     const artwork = desc.artworks[artworkType];
     if (artwork.path !== '') {
-      console.log(`Reading artwork file: ${artwork.path}`)
-      const artworkData = await readWholeFile(serverAPI, artwork.path);
-      if (artworkData === null) {
-        console.error(`Failed to read artwork file: ${artwork.path}`);
-        continue;
-      }
-
-      const b64 = Base64.fromUint8Array(artworkData);
+      console.log(`Reading artwork file: ${artwork.path}`);
       try {
+        const artworkData = await readWholeFile(serverAPI, artwork.path, token);
+        const b64 = Base64.fromUint8Array(artworkData);
         await SteamClient.Apps.SetCustomArtworkForApp(appId, b64, 'png', artwork.type);
-        await delay(500);
       } catch (ex) {
         console.error(`Set artwork file failed: ${artwork.path}`);
         console.error(ex);
       }
+      await delay(500);
     }
+    token?.throwIfCancelled();
   }
   return appId;
+};
+
+/**
+ * Syncing database with game collection
+ */
+export const syncDatabase = async (serverAPI: ServerAPI, updateHint?: (content: string) => void,
+    token?: CancellationToken) => {
+  const games = await getAllManagedGames(serverAPI, token);
+  for (const e in games) {
+    const appId = games[e];
+    try {
+      if (!testIfGameAppExists(appId)) {
+        console.log(`Removing shortcut: ${appId}`);
+        if (updateHint) {
+          updateHint(`Removing ${appId}`);
+        }
+        await removeManagedGame(serverAPI, e);
+      }
+    } catch (ex) {
+      console.error(`Removing shortcut fail, appId: ${appId}`);
+      console.error(ex);
+    }
+    token?.throwIfCancelled();
+  }
+};
+
+/**
+ * Clear all games in collection
+ */
+export const clearAll = async (serverAPI: ServerAPI, updateHint?: (content: string) => void,
+    token?: CancellationToken) => {
+  const games = await getAllManagedGames(serverAPI, token);
+  for (const e in games) {
+    const appId = games[e];
+    try {
+      if (testIfGameAppExists(appId)) {
+        console.log(`Removing shortcut: ${appId}`);
+        if (updateHint) {
+          updateHint(`Removing ${appId}`);
+        }
+        SteamClient.Apps.RemoveShortcut(appId);
+        await delay(500);
+      }
+      await removeManagedGame(serverAPI, e);
+    } catch (ex) {
+      console.error(`Removing shortcut fail, appId: ${appId}`);
+      console.error(ex);
+    }
+    token?.throwIfCancelled();
+  }
 };

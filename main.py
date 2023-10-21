@@ -422,7 +422,7 @@ class Plugin:
         decky_plugin.logger.info(f"Managed game count: {count}")
         return count
 
-    async def refresh_games(self):
+    async def refresh_games(self) -> bool:
         """
         Refresh local games
         """
@@ -465,8 +465,10 @@ class Plugin:
             Plugin.state.games = scanned_games
         except Exception:
             decky_plugin.logger.exception("Failed to refresh games")
+            return False
         finally:
             Plugin.state.scanning = False
+        return True
 
     async def get_managed_games(self, page: int) -> Dict[str, int]:
         """

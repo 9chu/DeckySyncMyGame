@@ -1,6 +1,9 @@
 lockfileVersion: '6.0'
 
 dependencies:
+  cancellationtoken:
+    specifier: ^2.2.0
+    version: 2.2.0
   decky-frontend-lib:
     specifier: ^3.23.0
     version: 3.23.0
@@ -407,6 +410,10 @@ packages:
     resolution: {integrity: sha512-zhaCDicdLuWN5UbN5IMnFqNMhNfo919sH85y2/ea+5Yg9TsTkeZxpL+JLbp6cgYFS4sRLp3YV4S6yDuqVWHYOw==}
     engines: {node: '>=6'}
     dev: true
+
+  /cancellationtoken@2.2.0:
+    resolution: {integrity: sha512-uF4sHE5uh2VdEZtIRJKGoXAD9jm7bFY0tDRCzH4iLp262TOJ2lrtNHjMG2zc8H+GICOpELIpM7CGW5JeWnb3Hg==}
+    dev: false
 
   /caniuse-lite@1.0.30001489:
     resolution: {integrity: sha512-x1mgZEXK8jHIfAxm+xgdpHpk50IN3z3q3zP261/WS+uvePxW8izXuCu6AHz0lkuYTlATDehiZ/tNyYBdSQsOUQ==}
