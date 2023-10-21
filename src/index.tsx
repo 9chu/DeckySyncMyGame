@@ -1,106 +1,77 @@
 import {
   ButtonItem,
   definePlugin,
-  DialogButton,
-  Menu,
-  MenuItem,
   PanelSection,
   PanelSectionRow,
   Router,
   ServerAPI,
-  showContextMenu,
   staticClasses,
 } from 'decky-frontend-lib';
 import { VFC, useEffect, useState } from 'react';
 import { RiRefreshFill } from 'react-icons/ri';
-
 import {
-  getGameCount,
-  syncAllGames,
-  getShortcutToRemove,
-  getShortcutToAdd,
-  notifyShortcutRemoved,
-  notifyShortcutAdded,
-  readFileBase64
+  getManagedGameCount,
+  isScanning,
+  refreshGames,
+  getAllRemovedGames,
+  getAllUnmanagedGames,
+  addManagedGame,
+  removeManagedGame,
 } from './backend';
+import { addGameApp } from './utils';
 import { SettingsRouter } from './components/settings/SettingsRouter';
-
-
-const delay = (t: number, val?: any) => new Promise(resolve => setTimeout(resolve, t, val));
 
 const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const [stateGameCount, stateSetGameCount] = useState<number>(0);
   const [stateRefreshInProgress, stateSetRefreshInProgress] = useState<boolean>(false);
 
-  const syncGameProcess = async (serverAPI: ServerAPI) => {
+  const handleRefreshGames = async (serverAPI: ServerAPI) => {
+    console.log('Start refresh');
+
     // Scan directories
-    await syncAllGames(serverAPI);
+    const ret = await refreshGames(serverAPI);
+    if (!ret) {
+      console.error(`refreshGames rets false`);
+      return;
+    }
   
-    // Update game count
-    stateSetGameCount(await getGameCount(serverAPI));
-    
     // Delete outdated games
-    const gamesToRemove = await getShortcutToRemove(serverAPI);
+    const gamesToRemove = await getAllRemovedGames(serverAPI);
+    console.log(`Deleting outdated games, count=${Object.keys(gamesToRemove).length}`);
     for (const key in gamesToRemove) {
       const appId = gamesToRemove[key];
       
-      // Remove shortcut
+      // Remove game
       try {
-        console.log('Removing shortcut:', key, appId);
+        console.log(`Removing game: ${appId}`);
         SteamClient.Apps.RemoveShortcut(appId);
-        await delay(500);
       } catch (ex) {
         console.error(ex);
       }
 
       // Notify backend
-      await notifyShortcutRemoved(serverAPI, key);
+      await removeManagedGame(serverAPI, key);
     }
 
     // Add new games
-    const gamesToAdd = await getShortcutToAdd(serverAPI);
+    const gamesToAdd = await getAllUnmanagedGames(serverAPI);
+    console.log(`Adding new games, count=${Object.keys(gamesToAdd).length}`);
     for (const key in gamesToAdd) {
       const game = gamesToAdd[key];
       
       let appId;
       try {
-        console.log('Adding shortcut:', key, game.name);
-        console.log(game);
+        console.log(`Adding game: ${game.name}`);
         
-        // Add shortcut
-        // Setting name, directory or launch options seems not to work
-        appId = await SteamClient.Apps.AddShortcut(
-          game.name,
-          game.executable,
-          game.directory,
-          '');
-
-        await delay(500);
-
-        SteamClient.Apps.SetShortcutName(appId, game.title);
-        SteamClient.Apps.SetShortcutStartDir(appId, game.directory);
-        if (game.options !== '')
-          SteamClient.Apps.SetShortcutLaunchOptions(appId, game.options);
-        if (game.compat !== '')
-          SteamClient.Apps.SpecifyCompatTool(appId, game.compat);
-        if (game.hidden) {
-          SteamClient.Apps.SetAppHidden(appId, true);
-          await delay(500);
-          SteamClient.Apps.SetAppHidden(appId, true);
+        // Add game app
+        appId = await addGameApp(serverAPI, game);
+        if (appId === null) {
+          console.error(`Failed to add game: ${game.name}`);
+          continue;
         }
 
-        // Set artworks
-        if (game.icon !== '')
-          (SteamClient.Apps as any).SetShortcutIcon(appId, game.icon);
-        if (game.grid !== '')
-          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.grid), 'png', 0);
-        if (game.hero !== '')
-          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.hero), 'png', 1);
-        if (game.logo !== '')
-          await SteamClient.Apps.SetCustomArtworkForApp(appId, await readFileBase64(serverAPI, game.logo), 'png', 2);
-
         // Notify backend
-        await notifyShortcutAdded(serverAPI, key, appId);
+        await addManagedGame(serverAPI, key, appId);
       } catch (ex) {
         console.error(ex);
 
@@ -113,22 +84,31 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         }
       }
     }
+
+    // Update game count
+    console.log(`Updating game counter`);
+    stateSetGameCount(await getManagedGameCount(serverAPI));
+
+    console.log('Refresh finished');
   };
   
   const onMount = async () => {
-    const count = await getGameCount(serverAPI);
+    const count = await getManagedGameCount(serverAPI);
     stateSetGameCount(count);
+
+    const scanning = await isScanning(serverAPI);
+    stateSetRefreshInProgress(scanning);
   };
 
-  const onRefreshClicked = (e: any) => {
+  const onRefreshClicked = () => {
     stateSetRefreshInProgress(true);
-    syncGameProcess(serverAPI)
+    handleRefreshGames(serverAPI)
       .finally(() => {
         stateSetRefreshInProgress(false);
       });
   };
 
-  const onOpenSettingsClicked = (e: any) => {
+  const onOpenSettingsClicked = () => {
     Router.CloseSideMenus();
     Router.Navigate('/decky-sync-my-game/settings');
   };

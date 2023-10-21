@@ -12,7 +12,6 @@ import { getConfig, setConfig } from '../../backend';
 import WithSuspense from '../WithSuspense';
 import SettingItem from './SettingItem';
 
-
 export const GeneralSettings: FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const [loading, setLoading] = useState(true);
   const [configGameLibDir, setConfigGameLibDir] = useState<string>('');

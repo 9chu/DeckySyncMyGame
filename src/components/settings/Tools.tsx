@@ -5,27 +5,20 @@ import {
   DialogControlsSectionHeader,
   Field,
   ServerAPI,
-  Spinner
 } from 'decky-frontend-lib';
 import { useEffect, useState, FC } from 'react';
-  
-import { getAllShortcuts, notifyShortcutRemoved } from '../../backend';
+import { getAllManagedGames, removeManagedGame } from '../../backend';
+import { testIfGameAppExists } from '../../utils';
 import WithSuspense from '../WithSuspense';
 
-
-const testIfShortcutExists = (appId: number) => {
-  let game = window.appStore.GetAppOverviewByAppID(appId);
-  return (game !== null);
-};
-
 const syncDatabase = async (serverAPI: ServerAPI) => {
-  const shortcuts = await getAllShortcuts(serverAPI);
-  for (const e in shortcuts) {
-    const appId = shortcuts[e];
+  const games = await getAllManagedGames(serverAPI);
+  for (const e in games) {
+    const appId = games[e];
     try {
-      if (!testIfShortcutExists(appId)) {
-        console.log('Removing shortcut:', e, appId);
-        await notifyShortcutRemoved(serverAPI, e);
+      if (!testIfGameAppExists(appId)) {
+        console.log(`Removing shortcut: ${appId}`);
+        await removeManagedGame(serverAPI, e);
       }
     } catch (ex) {
       console.error(ex);
@@ -39,8 +32,7 @@ export const Tools: FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const onMount = async () => {
   };
 
-  const onSyncDatabaseClicked = (e: any) => {
-    console.log('Sync database')
+  const onSyncDatabaseClicked = () => {
     stateSetSyncDatabaseInProgress(true);
     syncDatabase(serverAPI)
       .finally(() => stateSetSyncDatabaseInProgress(false));
@@ -56,8 +48,8 @@ export const Tools: FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
       <DialogBody>
         <DialogControlsSection>
           <DialogControlsSectionHeader>Prepair</DialogControlsSectionHeader>
-          <Field description="Remove already deleted shortcuts from database.">
-            <ButtonItem onClick={onSyncDatabaseClicked} disabled={stateSyncDatabaseInProgress}>Sync database</ButtonItem>
+          <Field description="Remove already deleted game apps from database.">
+            <ButtonItem onClick={onSyncDatabaseClicked} disabled={stateSyncDatabaseInProgress}>Sync Database</ButtonItem>
           </Field>
         </DialogControlsSection>
       </DialogBody>

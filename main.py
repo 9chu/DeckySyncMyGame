@@ -6,6 +6,8 @@ import sqlite3
 import hashlib
 import asyncio
 import fnmatch
+import concurrent.futures
+from pathlib import Path
 from typing import Callable, Any, Optional, List, Dict, Tuple, Union
 
 # Compatible code when running without decky
@@ -25,194 +27,274 @@ except ImportError:
     decky_plugin = DeckyPluginMock()
 
 
-################################################################################
-# Constants
-################################################################################
+# <editor-fold desc="Constants">
 
 CONFIG_DATABASE_PATH = os.path.join(os.environ["DECKY_PLUGIN_SETTINGS_DIR"], "database.sqlite")
 DEFAULT_GAME_LIB_DIR = "~/MyGames"
 GAME_INFO_FILENAME = ".gameinfo.json"
-GAME_ICON_FILENAME = ".gameicon.png"
-GAME_HERO_FILENAME = ".gamehero.png"
-GAME_LOGO_FILENAME = ".gamelogo.png"
-GAME_GRID_FILENAME = ".gamegrid.png"
 
-################################################################################
-# Utils
-################################################################################
+ARTWORK_TYPE_ICON = -1  # special traits for icon, not the steam definition
+ARTWORK_TYPE_GRID = 0
+ARTWORK_TYPE_HERO = 1
+ARTWORK_TYPE_LOGO = 2
 
-async def async_run(func: Callable[[], Any]) -> Any:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, func)
+ARTWORK_FILENAME = {
+    ARTWORK_TYPE_ICON: ".gameicon.png",
+    ARTWORK_TYPE_GRID: ".gamegrid.png",
+    ARTWORK_TYPE_HERO: ".gamehero.png",
+    ARTWORK_TYPE_LOGO: ".gamelogo.png",
+}
 
+# </editor-fold>
 
-async def async_walk_dir(path: str, filter: str) -> List[str]:
-    def impl():
-        matches = []
-        for root, dirnames, filenames in os.walk(path):
-            for filename in filenames:
-                if fnmatch.fnmatch(filename, filter):
-                    matches.append(os.path.join(root, filename))
-        return matches
-    return await async_run(impl)
+# <editor-fold desc="Async ops">
+
+Executor = concurrent.futures._base.Executor
 
 
-async def async_read_json_file(path: str) -> Any:
+async def _run_in_executor(executor: Optional[Executor], func: Callable[..., Any], *args) -> Any:
+    if not executor:
+        return func(*args)
+    return await asyncio.get_event_loop().run_in_executor(executor, func, *args)
+
+
+async def async_walk_dir(executor: Optional[Executor], path: str, filter: str) -> List[str]:
+    """
+    Recursively walk a directory asynchronously
+    :param executor: Executor to run the task
+    :param path: Path to the directory
+    :param filter: Filter to match the file name
+    """
+    def filter_dir(path: Path):
+        ret = []
+        recursive = []
+        for file in path.iterdir():
+            if fnmatch.fnmatch(file.name, filter):
+                ret.append(str(file.absolute()))
+            if file.is_dir():
+                recursive.append(file)
+        return ret, recursive
+
+    async def async_filter_dir(path: Path):
+        ret, recursive = await _run_in_executor(executor, filter_dir, path)
+        if executor is None:
+            rets = []
+            for file in recursive:
+                rets.append(await async_filter_dir(file))
+        else:
+            tasks = []
+            for file in recursive:
+                tasks.append(asyncio.create_task(async_filter_dir(file)))
+            rets = await asyncio.gather(*tasks)
+        for r in rets:
+            ret.extend(r)
+        return ret
+
+    return await async_filter_dir(Path(path))
+
+
+async def async_read_json_file(executor: Optional[Executor], path: str) -> Any:
+    """
+    Read a JSON file asynchronously
+    :param executor: Executor to run the task
+    :param path: Path to the file
+    """
     def impl():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return await async_run(impl)
+    return await _run_in_executor(executor, impl)
 
 
-async def async_calc_md5(path: str) -> str:
+async def async_calc_md5(executor: Optional[Executor], path: str) -> str:
+    """
+    Calculate MD5 of a file asynchronously
+    :param executor: Executor to run the task
+    :param path: Path to the file
+    """
     def impl():
         hash_md5 = hashlib.md5()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
-    return await async_run(impl)
+    return await _run_in_executor(executor, impl)
 
 
-async def async_read_file_base64(path: str) -> str:
+async def async_read_file(executor: Optional[Executor], path: str, offset: int, size: int) -> Optional[bytes]:
+    """
+    Read a file asynchronously
+    :param executor: Executor to run the task
+    :param path: Path to the file
+    :param offset: Offset to read
+    :param size: Size to read
+    """
     def impl():
         with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-    return await async_run(impl)
+            f.seek(offset, os.SEEK_SET)
+            return f.read(size)
+    return await _run_in_executor(executor, impl)
 
-################################################################################
-# Main
-################################################################################
+# </editor-fold>
+
+# <editor-fold desc="DB Proxy">
 
 class DbProxy:
+    """
+    SQLite database operations
+    """
     def __init__(self, path: str):
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-
-        self._async_task_future = None  # type: Optional[asyncio.Future]
-        self._pending_sql = []  # type: List[Tuple[asyncio.Future, str, Tuple]]
-
+        self._conn = sqlite3.connect(path)
         self._dirty = False
 
-    def _async_task(self):
-        while len(self._pending_sql) > 0:
-            fut, sql, args = self._pending_sql.pop(0)
-            decky_plugin.logger.debug(f"Execute SQL: {sql} {args}")
-            try:
-                result = self._conn.cursor().execute(sql, args).fetchall()
-                fut.set_result(result)
-            except Exception as ex:
-                fut.set_exception(ex)
-            if len(self._pending_sql) == 0:
-                time.sleep(0.5)
+    def _execute_sql(self, sql: str, args=()) -> list[Any]:
+        decky_plugin.logger.debug(f"Execute SQL: {sql} {args}")
+        return self._conn.cursor().execute(sql, args).fetchall()
 
-    def _async_execute_sql(self, sql: str, args = ()) -> asyncio.Future:
-        decky_plugin.logger.debug(f"Add SQL to queue: {sql} {args}")
-
-        def start_async_task():
-            if self._async_task_future is None:
-                loop = asyncio.get_event_loop()
-                self._async_task_future = loop.run_in_executor(None, self._async_task)
-                self._async_task_future.add_done_callback(lambda _: on_async_task_finished())
-
-        def on_async_task_finished():
-            decky_plugin.logger.debug(f"Async task finished")
-            self._async_task_future = None
-            if len(self._pending_sql) > 0:  # Due to concorrent call, we need to check it again
-                start_async_task()
-
-        future = asyncio.Future()
-        self._pending_sql.append((future, sql, args))
-        start_async_task()
-
-        return future
-    
-    async def prepare_database(self):
-        await self._async_execute_sql("""CREATE TABLE IF NOT EXISTS `Games` (
+    def prepare_database(self):
+        """
+        Prepare the database, setup tables if not exists
+        """
+        self._execute_sql("""CREATE TABLE IF NOT EXISTS `Games` (
             `Key` TEXT PRIMARY KEY,
             `SteamAppId` BIGINT NOT NULL,
             `Reserved` TEXT,
 
             UNIQUE (`SteamAppId`)
         )""")
-        await self._async_execute_sql("""CREATE TABLE IF NOT EXISTS `Config` (
+        self._execute_sql("""CREATE TABLE IF NOT EXISTS `Config` (
             `Name` TEXT PRIMARY KEY,
             `Value` TEXT NOT NULL
         )""")
         self._dirty = True
 
-    async def get_config(self, name: str, default: Optional[str] = None) -> Optional[str]:
-        result = await self._async_execute_sql("SELECT `Value` FROM `Config` WHERE `Name` = ?", (name,))
+    def get_config(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        Get config value from database
+        """
+        result = self._execute_sql("SELECT `Value` FROM `Config` WHERE `Name` = ?", (name,))
         if len(result) == 0:
             return default
         return result[0][0]
-    
-    async def set_config(self, name: str, value: str):
-        await self._async_execute_sql("INSERT INTO `Config`(`Name`, `Value`) VALUES (?, ?) " +
-            "ON CONFLICT(`Name`) DO UPDATE SET `Value` = ?", (name, value, value))
-        self._dirty = True
-        
-    async def count_shortcuts(self):
-        result = await self._async_execute_sql("SELECT COUNT(*) FROM `Games`")
-        return result[0][0]
 
-    async def get_all_shortcuts(self) -> Dict[str, int]:
+    def set_config(self, name: str, value: str):
+        """
+        Set config value to database
+        """
+        self._execute_sql("INSERT INTO `Config`(`Name`, `Value`) VALUES (?, ?) "
+                          "ON CONFLICT(`Name`) DO UPDATE SET `Value` = ?", (name, value, value))
+        self._dirty = True
+
+    def count_managed_games(self):
+        """
+        Count the number of games in database
+        """
+        result = self._execute_sql("SELECT COUNT(*) FROM `Games`")
+        return int(result[0][0])
+
+    def get_managed_games(self, offset: Optional[int]=None, limit: Optional[int]=None) -> Dict[str, int]:
+        """
+        Retrieve games from database
+        """
         ret = {}
-        records = await self._async_execute_sql("SELECT `Key`, `SteamAppId` FROM `Games`")
+        if limit is None:
+            records = self._execute_sql("SELECT `Key`, `SteamAppId` FROM `Games`")
+        else:
+            if offset is not None:
+                records = self._execute_sql(f"SELECT `Key`, `SteamAppId` FROM `Games` LIMIT {limit} OFFSET {offset}")
+            else:
+                records = self._execute_sql(f"SELECT `Key`, `SteamAppId` FROM `Games` LIMIT {limit}")
         for record in records:
             ret[record[0]] = record[1]
         return ret
-    
-    async def add_shortcut(self, key: str, steam_app_id: int):
-        await self._async_execute_sql("INSERT INTO `Games`(`Key`, `SteamAppId`) VALUES (?, ?) " +
-            "ON CONFLICT(`Key`) DO UPDATE SET `SteamAppId` = ?", (key, steam_app_id, steam_app_id))
+
+    def add_managed_game(self, key: str, steam_app_id: int):
+        """
+        Add a game definition into database
+        """
+        self._execute_sql("INSERT INTO `Games`(`Key`, `SteamAppId`) VALUES (?, ?) "
+                          "ON CONFLICT(`Key`) DO UPDATE SET `SteamAppId` = ?", (key, steam_app_id, steam_app_id))
         self._dirty = True
 
-    async def remove_shortcut(self, key: str):
-        await self._async_execute_sql("DELETE FROM `Games` WHERE `Key` = ?", (key,))
+    def remove_managed_game(self, key: str):
+        """
+        Remove a game definition from database
+        """
+        self._execute_sql("DELETE FROM `Games` WHERE `Key` = ?", (key,))
         self._dirty = True
 
     def commit(self):
-        if self._dirty and self._async_task_future is None:
+        if self._dirty:
             self._dirty = False
             decky_plugin.logger.info("Saving changes")
             try:
                 self._conn.commit()
-            except Exception as ex:
+            except Exception:
                 decky_plugin.logger.exception("Failed to commit database")
-    
-    async def close(self):
-        if self._async_task_future is not None:
-            await self._async_task_future
-            self._async_task_future = None
+
+    def close(self):
         self.commit()
         self._conn.close()
 
+# </editor-fold>
+
+# <editor-fold desc="Game Definitions">
+
+class GameArtworkDesc:
+    """
+    Artwork definition
+    """
+    @staticmethod
+    async def from_file(executor: Optional[Executor], artwork_type: int, path: str) -> Optional["GameArtworkDesc"]:
+        """
+        Create an artwork definition from a file, calculating the MD5
+        :param executor: Executor to run the task
+        :param artwork_type: Artwork type
+        :param path: Path to the file
+        """
+        if not os.path.exists(path):
+            return None
+        md5 = await async_calc_md5(executor, path)
+        return GameArtworkDesc(artwork_type, path, md5)
+
+    def __init__(self, artwork_type: int, path: str, md5: str):
+        self.artwork_type = artwork_type
+        self.path = path
+        self.md5 = md5
+
+    def to_dict(self):
+        return {
+            "type": self.artwork_type,
+            "path": self.path,
+            "md5": self.md5,
+        }
+
 
 class GameDesc:
+    """
+    Game definition
+    """
     @staticmethod
-    async def load_artwork(dir, filename):
-        path = os.path.join(dir, filename)
-        if os.path.exists(path):
-            md5 = await async_calc_md5(path)
-        else:
-            md5 = ''
-        return path, md5
-
-    @staticmethod
-    async def from_file(path: str) -> "GameDesc":
+    async def from_file(executor: Optional[Executor], path: str) -> "GameDesc":
+        """
+        Load a game definition from the json file
+        :param executor: Executor to run the task
+        :param path: Path to the json file
+        """
         desc_dir = os.path.abspath(os.path.dirname(path))
 
-        data = await async_read_json_file(path)
+        data = await async_read_json_file(executor, path)
         if not isinstance(data, dict):
             raise RuntimeError(f"Invalid game info file: {path}")
         if "name" not in data or "executable" not in data:
             raise RuntimeError(f"Invalid game info file: {path}")
 
         # looking for artworks
-        icon_path, icon_md5 = await GameDesc.load_artwork(desc_dir, GAME_ICON_FILENAME)
-        hero_path, hero_md5 = await GameDesc.load_artwork(desc_dir, GAME_HERO_FILENAME)
-        logo_path, logo_md5 = await GameDesc.load_artwork(desc_dir, GAME_LOGO_FILENAME)
-        grid_path, grid_md5 = await GameDesc.load_artwork(desc_dir, GAME_GRID_FILENAME)
+        artworks = {}
+        for artwork_type in ARTWORK_FILENAME.keys():
+            artwork_path = os.path.join(desc_dir, ARTWORK_FILENAME[artwork_type])
+            artwork = await GameArtworkDesc.from_file(executor, artwork_type, artwork_path)
+            if artwork is not None:
+                artworks[artwork_type] = artwork
 
         return GameDesc(
             path,
@@ -223,36 +305,35 @@ class GameDesc:
             data.get("options", ""),
             data.get("compat", ""),
             data.get("hidden", False),
-            icon_md5, icon_path if icon_md5 != '' else '',
-            hero_md5, hero_path if hero_md5 != '' else '',
-            logo_md5, logo_path if logo_md5 != '' else '',
-            grid_md5, grid_path if grid_md5 != '' else '')
+            artworks)
 
-    def __init__(self, meta_path, name, title, executable, directory, options, compat, hidden, icon_md5, icon_path,
-                 hero_md5, hero_path, logo_md5, logo_path, grid_md5, grid_path):
-        self.meta_path = meta_path  # type: str
-        self.name = name  # type: str
-        self.title = title  # type: str
-        self.executable = executable  # type: str
-        self.directory = directory  # type: str
-        self.options = options  # type: str
-        self.compat = compat  # type: str
-        self.hidden = hidden  # type: bool
-        self.icon_md5 = icon_md5  # type: str
-        self.icon_path = icon_path  # type: str
-        self.hero_md5 = hero_md5  # type: str
-        self.hero_path = hero_path  # type: str
-        self.logo_md5 = logo_md5  # type: str
-        self.logo_path = logo_path  # type: str
-        self.grid_md5 = grid_md5  # type: str
-        self.grid_path = grid_path  # type: str
+    def __init__(self, meta_path: str, name: str, title: str, executable: str, directory: str, options: str,
+                 compat: str, hidden: bool, artworks: Dict[int, GameArtworkDesc]):
+        self.meta_path = meta_path
+        self.name = name
+        self.title = title
+        self.executable = executable
+        self.directory = directory
+        self.options = options
+        self.compat = compat
+        self.hidden = hidden
+        self.artworks = artworks
 
-    def make_key(self):
+    def make_key(self) -> str:
+        """
+        Generate a unique key for this game description
+        """
         unique_desc = [self.meta_path, self.name, self.title, self.executable, self.directory, self.options,
-                       self.compat, str(self.hidden), self.icon_md5, self.hero_md5, self.logo_md5, self.grid_md5]
+                       self.compat, str(self.hidden)]
+        for artwork_type in sorted(self.artworks.keys()):
+            unique_desc.append(self.artworks[artwork_type].md5)
         return hashlib.sha256(":".join(unique_desc).encode("utf-8")).hexdigest()
-    
+
     def to_dict(self):
+        artworks = {}
+        for k in self.artworks:
+            v = self.artworks[k].to_dict()
+            artworks[k] = v
         return {
             "name": self.name,
             "title": self.title,
@@ -261,211 +342,222 @@ class GameDesc:
             "options": self.options,
             "compat": self.compat,
             "hidden": self.hidden,
-            "icon": self.icon_path,
-            "hero": self.hero_path,
-            "logo": self.logo_path,
-            "grid": self.grid_path,
+            "artworks": artworks,
         }
 
+# </editor-fold>
 
-class PluginImpl:
+# <editor-fold desc="Plugin implementation">
+
+class PluginState:
+    """
+    Since Decky not creating an instance, using this class to store the state
+    """
     def __init__(self):
         decky_plugin.logger.info("Initializing")
-        self._db = DbProxy(CONFIG_DATABASE_PATH)
+
+        # Load db
+        self.db = DbProxy(CONFIG_DATABASE_PATH)
 
         # state
-        self._games = {}  # type: dict[str, GameDesc]
-        self._scanning = False
-        self._shortcut_to_remove = {}  # type: Dict[str, int]
-        self._shortcut_to_add = {}  # type: Dict[str, Dict]
+        self.running = True
+        self.scanning = False
+        self.games = {}  # type: Dict[str, GameDesc]
 
-        # request queue
-        self._request_queue = []  # type: List[Tuple[asyncio.Future, Callable, Tuple]]
+        decky_plugin.logger.info("Initializing finished")
 
-    def _push_request(self, func: Callable, args: Tuple) -> asyncio.Future:
-        future = asyncio.Future()
-        self._request_queue.append((future, func, args))
-        return future
-    
-    async def _sync_all_games(self):
-        if self._scanning:
-            return
-        self._scanning = True
+    def close(self):
+        """
+        Shutdown
+        """
+        self.running = False
+        self.db.close()
 
+
+class Plugin:
+    state: PluginState
+
+    async def _main(self):
+        Plugin.state = PluginState()
+        while Plugin.state.running:
+            Plugin.state.db.commit()
+            await asyncio.sleep(1)
+
+    async def _unload(self):
+        Plugin.state.close()
+
+    async def _migration(self):
+        # Nothing to do
+        pass
+
+    # <editor-fold desc="IPC Commands">
+
+    async def get_config(self, key: str):
+        """
+        Get config value by key
+        :param key: config key
+        :return: config value
+        """
+        return Plugin.state.db.get_config(key)
+
+    async def set_config(self, key: str, value: str) -> None:
+        """
+        Set config value by key
+        :param key: config key
+        :param value: config value
+        """
+        Plugin.state.db.set_config(key, value)
+
+    async def is_scanning(self) -> bool:
+        """
+        Is scanning in progress
+        """
+        return Plugin.state.scanning
+
+    async def get_managed_game_count(self) -> int:
+        """
+        Count of games been recorded in database
+        """
+        count = Plugin.state.db.count_managed_games()
+        decky_plugin.logger.info(f"Managed game count: {count}")
+        return count
+
+    async def refresh_games(self):
+        """
+        Refresh local games
+        """
         try:
-            config_game_lib_dir = (await self._db.get_config("GameLibDir", "")).strip()
+            # Waiting until current task finished
+            if Plugin.state.scanning:
+                while Plugin.state.scanning:
+                    await asyncio.sleep(1)
+                return
+
+            Plugin.state.scanning = True
+            decky_plugin.logger.info("Start scanning games")
+
+            # Make local game library path
+            config_game_lib_dir = Plugin.state.db.get_config("GameLibDir", "").strip()
             if len(config_game_lib_dir) == 0:
                 config_game_lib_dir = DEFAULT_GAME_LIB_DIR
             game_lib_dir = os.path.abspath(os.path.expanduser(config_game_lib_dir))
 
-            db_games = await self._db.get_all_shortcuts()
-
-            decky_plugin.logger.info("Start scanning games")
-            desc = {}
-            files = await async_walk_dir(game_lib_dir, GAME_INFO_FILENAME)
+            # Scanning local games
+            # with concurrent.futures.ThreadPoolExecutor() as executor:
+            #     scanned_games = {}
+            #     files = await async_walk_dir(executor, game_lib_dir, GAME_INFO_FILENAME)
+            #     for file in files:
+            #         try:
+            #             game_desc = await GameDesc.from_file(executor, file)
+            #             scanned_games[game_desc.make_key()] = game_desc
+            #         except Exception as ex:
+            #             decky_plugin.logger.exception(f"Failed to load game desc: {file}")
+            scanned_games = {}
+            files = await async_walk_dir(None, game_lib_dir, GAME_INFO_FILENAME)
             for file in files:
                 try:
-                    game_desc = await GameDesc.from_file(file)
-                    desc[game_desc.make_key()] = game_desc
+                    game_desc = await GameDesc.from_file(None, file)
+                    scanned_games[game_desc.make_key()] = game_desc
                 except Exception as ex:
-                    decky_plugin.logger.exception(f"Failed to load game info file: {file}")
-            decky_plugin.logger.info(f"Found {len(desc)} games")
+                    decky_plugin.logger.exception(f"Failed to load game desc: {file}")
+            decky_plugin.logger.info(f"Found {len(scanned_games)} games")
 
-            self._shortcut_to_remove = {}
-            no_longer_exists = set(db_games.keys()) - set(desc.keys())
-            if len(no_longer_exists) > 0:
-                decky_plugin.logger.info(f"Found {len(no_longer_exists)} games that no longer exists")
-                for key in no_longer_exists:
-                    self._shortcut_to_remove[key] = db_games[key]
-            
-            self._shortcut_to_add = {}
-            newer = set(desc.keys()) - set(db_games.keys())
-            if len(newer) > 0:
-                decky_plugin.logger.info(f"Found {len(newer)} games that are new")
-                for key in newer:
-                    self._shortcut_to_add[key] = desc[key].to_dict()
-
-            self._games = desc
-        except Exception as ex:
-            decky_plugin.logger.exception("Failed to sync games")
+            Plugin.state.games = scanned_games
+        except Exception:
+            decky_plugin.logger.exception("Failed to refresh games")
         finally:
-            self._scanning = False
+            Plugin.state.scanning = False
 
-    async def _notify_shortcut_removed(self, key: str):
-        try:
-            await self._db.remove_shortcut(key)
-        except Exception as ex:
-            decky_plugin.logger.exception(f"Failed to remove shortcut: {key}")
-        
-    async def _notify_shortcut_added(self, key: str, steam_app_id: int):
-        try:
-            await self._db.add_shortcut(key, steam_app_id)
-        except Exception as ex:
-            decky_plugin.logger.exception(f"Failed to add shortcut: {key}")
+    async def get_managed_games(self, page: int) -> Dict[str, int]:
+        """
+        Retrieve games from database
+        Result is split into pages, returns 50 records per call.
+        Returns mapping of key of managed games and its steam app id.
+        :param page: page index from 0 to ceil(n/50)
+        """
+        return Plugin.state.db.get_managed_games(page * 50, 50)
 
-    async def sync_all_games(self):
-        await self._push_request(self._sync_all_games, ())
+    async def get_unmanaged_games(self, page: int) -> Dict[str, dict]:
+        """
+        Retrieve games that not in database
+        Result is split into pages, returns 20 records per call.
+        :param page: page index from 0 to ceil(n/20)
+        """
+        all_keys = set(Plugin.state.games.keys())
+        managed_keys = set(Plugin.state.db.get_managed_games().keys())
+        intersection = all_keys - managed_keys
 
-    async def is_scanning(self):
-        return self._scanning
-    
-    async def get_game_count(self):
-        ret = len(self._games)
-        if ret == 0:
-            return await self._db.count_shortcuts()
+        ret = {}
+        index = 0
+        offset = page * 20
+        limit = 20
+        for i in intersection:
+            if index < offset:
+                pass
+            elif offset <= index < offset + limit:
+                ret[i] = Plugin.state.games[i].to_dict()
+            else:
+                break
+            index += 1
         return ret
 
-    async def get_all_shortcuts(self):
-        return await self._db.get_all_shortcuts()
+    async def get_removed_games(self, page: int) -> Dict[str, int]:
+        """
+        Retrieve games that are already removed in local filesystem.
+        Result is split into pages, returns 50 records per call.
+        :param page: page index from 0 to ceil(n/50)
+        """
+        all_keys = set(Plugin.state.games.keys())
+        managed_games = Plugin.state.db.get_managed_games()
+        managed_keys = set(managed_games.keys())
+        intersection = managed_keys - all_keys
 
-    async def get_shortcut_to_remove(self):
-        return self._shortcut_to_remove
-    
-    async def get_shortcut_to_add(self):
-        return self._shortcut_to_add
-    
-    async def notify_shortcut_removed(self, key: str):
-        await self._push_request(self._notify_shortcut_removed, (key,))
+        ret = {}
+        index = 0
+        offset = page * 50
+        limit = 50
+        for i in intersection:
+            if index < offset:
+                pass
+            elif offset <= index < offset + limit:
+                ret[i] = managed_games[i]
+            else:
+                break
+            index += 1
+        return ret
 
-    async def notify_shortcut_added(self, key: str, steam_app_id: int):
-        await self._push_request(self._notify_shortcut_added, (key, steam_app_id))
+    async def add_managed_game(self, key: str, steam_app_id: int):
+        """
+        Append record into database
+        :param key: key of game
+        :param steam_app_id: id generated by steamclient
+        """
+        Plugin.state.db.add_managed_game(key, steam_app_id)
 
-    async def get_config(self, key: str):
-        return await self._db.get_config(key)
+    async def remove_managed_game(self, key: str):
+        """
+        Remove record from database
+        :param key: key of game
+        """
+        Plugin.state.db.remove_managed_game(key)
 
-    async def set_config(self, key: str, value: str):
-        await self._db.set_config(key, value)
-
-    async def run(self):
-        decky_plugin.logger.info("Preparing database")
+    async def read_file(self, path: str, offset: int, size: int) -> Optional[str]:
+        """
+        Read a file
+        :param path: Path to the file
+        :param offset: Offset to read
+        :param size: Size to read
+        """
         try:
-            await self._db.prepare_database()
-        except Exception as ex:
-            decky_plugin.logger.exception("Failed to initialize database")
+            # with concurrent.futures.ThreadPoolExecutor() as executor:
+            #     chunk = await async_read_file(executor, path, offset, size)
+            #     return base64.b64encode(chunk).decode("utf-8")
+            chunk = await async_read_file(None, path, offset, size)
+            return base64.b64encode(chunk).decode("utf-8")
+        except Exception:
+            decky_plugin.logger.exception(f"Failed to read file: {path}")
+            return None
 
-        decky_plugin.logger.info("Entering main loop")
-        while True:
-            if len(self._request_queue) == 0:
-                self._db.commit()
-                await asyncio.sleep(1)
-                continue
-            future, func, args = self._request_queue.pop(0)
-            try:
-                if func is not None:
-                    result = await func(*args)
-                else:
-                    result = None
-                future.set_result(result)
-            except Exception as ex:
-                decky_plugin.logger.exception("Failed to execute request")
-                future.set_exception(ex)
+    # </editor-fold>
 
-    async def unload(self):
-        await self._push_request(None, None)
-        await self._db.close()
-        
-    async def migration(self):
-        pass
-
-
-class Plugin:
-    instance: PluginImpl
-
-    async def sync_all_games(self):  # export
-        return await self.instance.sync_all_games()
-
-    async def is_scanning(self):  # export
-        return await self.instance.is_scanning()
-    
-    async def get_game_count(self):  # export
-        return await self.instance.get_game_count()
-    
-    async def get_all_shortcuts(self):  # export
-        return await self.instance.get_all_shortcuts()
-
-    async def get_shortcut_to_remove(self):  # export
-        return await self.instance.get_shortcut_to_remove()
-    
-    async def get_shortcut_to_add(self):  # export
-        return await self.instance.get_shortcut_to_add()
-    
-    async def notify_shortcut_removed(self, key: str):  # export
-        return await self.instance.notify_shortcut_removed(key)
-
-    async def notify_shortcut_added(self, key: str, steam_app_id: int):  # export
-        return await self.instance.notify_shortcut_added(key, steam_app_id)
-
-    async def get_config(self, key: str):  # export
-        return await self.instance.get_config(key)
-
-    async def set_config(self, key: str, value: str):  # export
-        return await self.instance.set_config(key, value)
-    
-    async def read_file_base64(self, path: str):  # export
-        return await async_read_file_base64(path)
-
-    async def _main(self):
-        Plugin.instance = self.instance = PluginImpl()
-        await self.instance.run()
-
-    async def _unload(self):
-        await Plugin.instance.unload()
-        
-    async def _migration(self):
-        pass
-
-
-async def _dev_main():
-    decky_plugin.logger.info("Running in dev mode")
-
-    plugin = Plugin()
-
-    f = asyncio.ensure_future(plugin.sync_all_games())
-    f.add_done_callback(lambda _: decky_plugin.logger.info("Done"))
-
-    await plugin._main()
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(_dev_main())
+# </editor-fold>

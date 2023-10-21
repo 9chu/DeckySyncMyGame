@@ -8,7 +8,6 @@ import { TbTool, TbAdjustments } from 'react-icons/tb';
 import { GeneralSettings } from './GeneralSettings';
 import { Tools } from './Tools';
 
-
 export const SettingsRouter: FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const pages = [
     {

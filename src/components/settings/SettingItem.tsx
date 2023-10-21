@@ -1,7 +1,6 @@
 import { Field, TextField, Toggle } from 'decky-frontend-lib';
 import { ChangeEventHandler, FunctionComponent } from 'react';
 
-
 interface SettingProps {
   type: string;
   label: string;
