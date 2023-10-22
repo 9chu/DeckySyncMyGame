@@ -32,11 +32,12 @@ export const addGameApp = async (serverAPI: ServerAPI, desc: GameDesc, token?: C
     '');  // cmdline
   if (appId === null || appId === undefined)
     throw new Error(`AddShortcut fail, name: ${desc.name}, exe: ${desc.executable}`);
-  await delay(500);
+  await delay(2000);  // FIXME: Sometimes the new shortcut has an empty name, seems waiting for a while can fix it
 
-  SteamClient.Apps.SetShortcutName(appId, desc.title);
-  await delay(500);
-  
+  if (desc.name !== desc.title) {
+    SteamClient.Apps.SetShortcutName(appId, desc.title);
+    await delay(1000);
+  }
   SteamClient.Apps.SetShortcutStartDir(appId, desc.directory);
 
   if (desc.options !== '') {

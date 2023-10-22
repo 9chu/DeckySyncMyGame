@@ -23,7 +23,7 @@ import {
   addManagedGame,
   removeManagedGame,
 } from './backend';
-import { delay, addGameApp } from './utils';
+import { delay, addGameApp, syncDatabase } from './utils';
 import { ModalLoading } from './components/ModalLoading';
 import { SettingsRouter } from './components/settings/SettingsRouter';
 
@@ -35,6 +35,13 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const handleRefreshGames = async (serverAPI: ServerAPI, updateHint: (content: string) => void,
       token: CancellationToken) => {
     console.log('Start refresh');
+
+    // Sync database
+    try {
+      await syncDatabase(serverAPI, updateHint, token);
+    } catch (ex) {
+      console.error(ex);
+    }
 
     // Scan directories
     await refreshGames(serverAPI);
@@ -148,7 +155,7 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   } else {
     statusElement = (
       <Field label='Managed games:'>
-        {stateGameCount}
+        {stateGameCount.toString()}
       </Field>
     )
   }
@@ -178,7 +185,7 @@ export default definePlugin((serverApi: ServerAPI) => {
   serverApi.routerHook.addRoute('/decky-sync-my-game/settings', () => <SettingsRouter serverAPI={serverApi} />);
 
   return {
-    title: <div className={staticClasses.Title}>Sync My Game</div>,
+    title: <div className={staticClasses.Title}>DeckySyncMyGame</div>,
     content: <Content serverAPI={serverApi} />,
     icon: <RiRefreshFill />,
     onDismount() {

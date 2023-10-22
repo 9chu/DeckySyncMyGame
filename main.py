@@ -376,20 +376,29 @@ class PluginState:
 
 class Plugin:
     state: PluginState
+    watchdog_task: asyncio.Task
+
+    @staticmethod
+    async def watchdog():
+        while Plugin.state.running:
+            await asyncio.sleep(1)
+            try:
+                Plugin.state.db.commit()
+            except Exception as e:
+                decky_plugin.logger.exception("Unhandled exception in watchdog")
 
     async def _main(self):
         Plugin.state = PluginState()
-        while Plugin.state.running:
-            Plugin.state.db.commit()
-            await asyncio.sleep(1)
+        Plugin.watchdog_task = asyncio.get_event_loop().create_task(Plugin.watchdog())
 
     async def _unload(self):
         Plugin.state.close()
+        #Plugin.watchdog_task.cancel()
 
     async def _migration(self):
         # Nothing to do
         pass
-
+    
     # <editor-fold desc="IPC Commands">
 
     async def get_config(self, key: str):
